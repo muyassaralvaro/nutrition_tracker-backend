@@ -21,10 +21,12 @@ class MealResource extends JsonResource
             'meal_time' => substr($this->meal_time, 0, 5),
             'title' => $this->title,
             'source' => $this->source,
+            'thumbnail_url' => $this->thumbnail_path ? route('meals.thumbnail', $this->id, false) : null,
             'items' => $this->whenLoaded('items', fn () => $this->items->map(fn ($item) => [
                 'id' => $item->id,
                 'food_id' => $item->food_id,
                 'name' => $item->name,
+                'description' => $item->description,
                 'grams' => $item->grams,
                 'nutrients' => $item->only(NutritionCalculator::NUTRIENTS),
             ])),

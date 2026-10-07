@@ -45,8 +45,4 @@ return [
         'url' => env('FRONTEND_URL', 'http://localhost:3000'),
     ],
 
-    'fdc' => [
-        'api_key' => env('FDC_API_KEY'),
-    ],
-
 ];

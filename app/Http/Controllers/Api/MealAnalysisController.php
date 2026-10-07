@@ -23,7 +23,11 @@ class MealAnalysisController extends Controller
             return response()->json(['message' => 'Photo analysis is unavailable. Enter meal details manually.', 'code' => 'provider_unavailable'], 503);
         }
 
-        $request->validate(['image' => ['required', 'file', 'mimetypes:image/jpeg,image/png,image/webp', 'max:10240']]);
+        $data = $request->validate([
+            'image' => ['required', 'file', 'mimetypes:image/jpeg,image/png,image/webp', 'max:10240'],
+            'language' => ['sometimes', 'in:en,id'],
+            'food_context' => ['nullable', 'string', 'max:500'],
+        ]);
 
         if ($request->user()->analyses()->whereIn('status', ['queued', 'processing'])->where('expires_at', '>', now())->count() >= 3) {
             return response()->json(['message' => 'Finish or retake an existing photo first.'], 429);
@@ -68,10 +72,11 @@ class MealAnalysisController extends Controller
             $analysis = $request->user()->analyses()->create([
                 'id' => $id,
                 'status' => 'queued',
+                'language' => $data['language'] ?? 'en',
                 'image_path' => $path,
                 'expires_at' => now()->addDay(),
             ]);
-            AnalyzeMealPhoto::dispatch($id)->onQueue('photos');
+            AnalyzeMealPhoto::dispatch($id, trim($data['food_context'] ?? ''))->onQueue('photos');
         } catch (\Throwable $exception) {
             $analysis?->delete();
             Storage::disk('local')->delete($path);

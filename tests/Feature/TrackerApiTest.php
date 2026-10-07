@@ -7,6 +7,7 @@ use Illuminate\Foundation\Testing\LazilyRefreshDatabase;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
 use Tests\TestCase;
 
@@ -158,6 +159,17 @@ class TrackerApiTest extends TestCase
         $ledger = storage_path('framework/testing/deletions-'.Str::uuid().'.jsonl');
         config()->set('app.account_deletion_ledger_path', $ledger);
         $user = User::factory()->create(['phone_e164' => '+6281234567891', 'password' => 'secret123']);
+        Storage::fake('local');
+        $thumbnailPath = 'meal-thumbnails/account-delete.jpg';
+        $avatarPath = 'avatars/'.$user->id.'/account-delete.jpg';
+        Storage::disk('local')->put($thumbnailPath, 'thumbnail bytes');
+        Storage::disk('local')->put($avatarPath, 'avatar bytes');
+        $user->update(['avatar_path' => $avatarPath]);
+        $user->meals()->create([
+            'client_request_id' => (string) Str::uuid(), 'create_payload_sha256' => str_repeat('0', 64),
+            'meal_date' => now()->toDateString(), 'meal_time' => '12:30', 'title' => 'Lunch',
+            'source' => 'photo', 'thumbnail_path' => $thumbnailPath,
+        ]);
         $id = $user->id;
         $createdAt = $user->created_at;
         $passwordHash = $user->password;
@@ -168,13 +180,28 @@ class TrackerApiTest extends TestCase
             $this->assertFileExists($ledger);
             $this->assertSame($id, json_decode(file_get_contents($ledger), true)['user_id']);
             $this->assertDatabaseMissing('users', ['id' => $id]);
+            Storage::disk('local')->assertMissing($thumbnailPath);
+            Storage::disk('local')->assertMissing($avatarPath);
 
             DB::table('users')->insert([
                 'id' => $id, 'name' => 'Restored', 'phone_e164' => '+6281234567891',
                 'password' => $passwordHash, 'created_at' => $createdAt, 'updated_at' => $createdAt,
             ]);
+            $restoredPath = 'meal-thumbnails/replayed-delete.jpg';
+            $restoredAvatarPath = 'avatars/'.$id.'/replayed-delete.jpg';
+            Storage::disk('local')->put($restoredPath, 'thumbnail bytes');
+            Storage::disk('local')->put($restoredAvatarPath, 'avatar bytes');
+            $restored = User::findOrFail($id);
+            $restored->update(['avatar_path' => $restoredAvatarPath]);
+            $restored->meals()->create([
+                'client_request_id' => (string) Str::uuid(), 'create_payload_sha256' => str_repeat('0', 64),
+                'meal_date' => now()->toDateString(), 'meal_time' => '12:30', 'title' => 'Lunch',
+                'source' => 'photo', 'thumbnail_path' => $restoredPath,
+            ]);
             $this->artisan('app:replay-account-deletions')->assertExitCode(0);
             $this->assertDatabaseMissing('users', ['id' => $id]);
+            Storage::disk('local')->assertMissing($restoredPath);
+            Storage::disk('local')->assertMissing($restoredAvatarPath);
         } finally {
             File::delete($ledger);
         }

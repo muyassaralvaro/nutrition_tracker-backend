@@ -7,7 +7,7 @@ use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 
-#[Fillable(['client_request_id', 'create_payload_sha256', 'meal_date', 'meal_time', 'title', 'source'])]
+#[Fillable(['client_request_id', 'create_payload_sha256', 'meal_date', 'meal_time', 'title', 'source', 'thumbnail_path'])]
 class Meal extends Model
 {
     public function user(): BelongsTo

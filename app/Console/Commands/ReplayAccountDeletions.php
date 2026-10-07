@@ -40,7 +40,11 @@ class ReplayAccountDeletions extends Command
                     continue;
                 }
 
-                $paths = $user->analyses()->whereNotNull('image_path')->pluck('image_path')->all();
+                $paths = [
+                    ...$user->analyses()->whereNotNull('image_path')->pluck('image_path')->all(),
+                    ...$user->meals()->whereNotNull('thumbnail_path')->pluck('thumbnail_path')->all(),
+                    ...($user->avatar_path ? [$user->avatar_path] : []),
+                ];
                 $user->delete();
                 Storage::disk('local')->delete($paths);
             }

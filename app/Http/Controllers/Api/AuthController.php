@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers\Api;
 
+use App\AvatarImage;
 use App\Http\Controllers\Controller;
 use App\Http\Resources\Api\UserResource;
 use App\Models\User;
@@ -68,6 +69,29 @@ class AuthController extends Controller
         return (new UserResource($request->user()))->response()->setStatusCode(200);
     }
 
+    public function avatar(Request $request): Response
+    {
+        $path = $request->user()->avatar_path;
+        abort_unless($path && Storage::disk('local')->exists($path), 404);
+
+        return response(Storage::disk('local')->get($path), 200, [
+            'Content-Type' => 'image/jpeg',
+            'Cache-Control' => 'private, no-store',
+            'X-Content-Type-Options' => 'nosniff',
+        ]);
+    }
+
+    public function updateAvatar(Request $request): JsonResponse
+    {
+        $data = $request->validate(['image' => ['required', 'file', 'mimetypes:image/jpeg,image/png,image/webp', 'max:3072']]);
+
+        if (! AvatarImage::store($request->user(), $data['image']->getContent())) {
+            throw ValidationException::withMessages(['image' => 'Choose a valid JPG, PNG, or WebP photo.']);
+        }
+
+        return (new UserResource($request->user()->refresh()))->response()->setStatusCode(200);
+    }
+
     public function logout(Request $request): Response
     {
         Auth::logout();
@@ -122,7 +146,11 @@ class AuthController extends Controller
             throw new RuntimeException('Account deletion ledger is unavailable.');
         }
 
-        $photoPaths = $user->analyses()->whereNotNull('image_path')->pluck('image_path')->all();
+        $photoPaths = [
+            ...$user->analyses()->whereNotNull('image_path')->pluck('image_path')->all(),
+            ...$user->meals()->whereNotNull('thumbnail_path')->pluck('thumbnail_path')->all(),
+            ...($user->avatar_path ? [$user->avatar_path] : []),
+        ];
         Auth::logout();
         $user->delete();
         Storage::disk('local')->delete($photoPaths);

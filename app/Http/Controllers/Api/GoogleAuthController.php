@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers\Api;
 
+use App\AvatarImage;
 use App\Http\Controllers\Controller;
 use App\Models\User;
 use Illuminate\Http\Request;
@@ -17,8 +18,8 @@ class GoogleAuthController extends Controller
         $this->ensureConfigured();
 
         if ($request->boolean('link')) {
-            abort_unless(Auth::check(), 401);
-            $request->session()->put('google_link_user_id', Auth::id());
+            abort_unless(Auth::guard('web')->check(), 401);
+            $request->session()->put('google_link_user_id', Auth::guard('web')->id());
         } else {
             $request->session()->forget('google_link_user_id');
         }
@@ -42,12 +43,13 @@ class GoogleAuthController extends Controller
             $linkUserId = $request->session()->pull('google_link_user_id');
 
             if ($linkUserId !== null) {
-                if (Auth::id() !== (int) $linkUserId || User::where('google_subject', $subject)->whereKeyNot($linkUserId)->exists()) {
+                if (Auth::guard('web')->id() !== (int) $linkUserId || User::where('google_subject', $subject)->whereKeyNot($linkUserId)->exists()) {
                     return redirect($frontend.'/settings?oauth=conflict');
                 }
 
                 $user = User::findOrFail($linkUserId);
                 $user->update(['google_subject' => $subject]);
+                $this->importAvatar($user, $google->getAvatar());
 
                 return redirect($frontend.'/settings?oauth=linked');
             }
@@ -68,7 +70,9 @@ class GoogleAuthController extends Controller
                 ]);
             }
 
-            Auth::login($user);
+            $this->importAvatar($user, $google->getAvatar());
+
+            Auth::guard('web')->login($user);
             $request->session()->regenerate();
             $request->session()->put('authenticated_at', now()->timestamp);
 
@@ -83,5 +87,14 @@ class GoogleAuthController extends Controller
     private function ensureConfigured(): void
     {
         abort_unless(config('services.google.client_id') && config('services.google.client_secret'), 503, 'Google sign-in is unavailable.');
+    }
+
+    private function importAvatar(User $user, mixed $url): void
+    {
+        try {
+            AvatarImage::importGoogle($user, $url);
+        } catch (Throwable $exception) {
+            report($exception);
+        }
     }
 }
