@@ -54,6 +54,8 @@ return [
 
     'url' => env('APP_URL', 'http://localhost'),
 
+    'account_deletion_ledger_path' => env('ACCOUNT_DELETION_LEDGER_PATH') ?: storage_path('app/private/account-deletions.jsonl'),
+
     /*
     |--------------------------------------------------------------------------
     | Application Timezone
