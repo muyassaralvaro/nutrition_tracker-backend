@@ -2,18 +2,22 @@
 
 namespace Tests\Feature;
 
-// use Illuminate\Foundation\Testing\RefreshDatabase;
 use Tests\TestCase;
 
 class ExampleTest extends TestCase
 {
-    /**
-     * A basic test example.
-     */
-    public function test_the_application_returns_a_successful_response(): void
+    public function test_public_root_and_private_file_url_are_not_served(): void
     {
-        $response = $this->get('/');
+        $this->get('/')->assertNotFound();
+        $this->get('/storage/meal-analyses/example.jpg')->assertNotFound();
+    }
 
-        $response->assertStatus(200);
+    public function test_private_gets_require_authentication(): void
+    {
+        $this->getJson('/api/v1/me')->assertUnauthorized();
+        $this->getJson('/api/v1/me/weights')->assertUnauthorized();
+        $this->getJson('/api/v1/meals')->assertUnauthorized();
+        $this->getJson('/api/v1/calendar')->assertUnauthorized();
+        $this->getJson('/api/v1/auth/options')->assertOk();
     }
 }
