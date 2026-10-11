@@ -7,6 +7,8 @@ use App\Models\NutrientTarget;
 
 class NutritionCalculator
 {
+    public const FORMULA_VERSION = 'v2';
+
     public const NUTRIENTS = ['calories', 'protein', 'carbs', 'fat', 'fiber', 'sodium', 'potassium', 'calcium', 'iron'];
 
     public const LIMITS = ['calories' => 6000, 'protein' => 1000, 'carbs' => 1500, 'fat' => 800, 'fiber' => 200, 'sodium' => 20000, 'potassium' => 20000, 'calcium' => 10000, 'iron' => 500];
@@ -26,13 +28,16 @@ class NutritionCalculator
         $sex = $input['sex'];
         $activity = $input['activity_type'];
         $goal = $input['goal'];
+        $goalWeight = isset($input['goal_weight_kg']) ? (float) $input['goal_weight_kg'] : null;
         $build = $input['body_build'];
 
         $intensity = ['daily' => 0.5, 'cardio' => 1.2, 'strength' => 1, 'mixed' => 1][$activity];
         $activeMinutes = $minutes * $intensity;
         $multiplier = $activeMinutes < 20 ? 1.2 : ($activeMinutes < 45 ? 1.375 : ($activeMinutes < 90 ? 1.55 : 1.725));
         $bmr = 10 * $weight + 6.25 * $height - 5 * $age + ($sex === 'male' ? 5 : -161);
-        $delta = $goal === 'lose' ? -250 : ($goal === 'gain' ? 250 : 0);
+        // ponytail: Goal distance adjusts the starting deficit, capped at 500 kcal/day; add a target date for pace-based planning.
+        $lossGap = $goal === 'lose' && $goalWeight !== null ? $weight - $goalWeight : 0;
+        $delta = $goal === 'lose' ? -min(500, 250 + $lossGap * 10 * $multiplier) : ($goal === 'gain' ? 250 : 0);
         $calories = (int) round(max(1200, min(4500, $bmr * $multiplier + $delta)) / 10) * 10;
         $trainingProtein = $minutes === 0 ? 0 : (in_array($activity, ['strength', 'mixed'], true) ? 0.3 : ($activity === 'cardio' ? 0.1 : 0));
         $proteinFactor = min(2, 1.2 + $trainingProtein + ($build === 'muscular' ? 0.2 : 0) + ($goal === 'lose' ? 0.2 : 0));

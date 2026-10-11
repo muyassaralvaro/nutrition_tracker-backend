@@ -60,6 +60,45 @@ class TrackerApiTest extends TestCase
             ->assertJsonPath('data.targets.sodium', 2300);
     }
 
+    public function test_loss_goal_weight_changes_estimate_with_a_capped_deficit(): void
+    {
+        $this->travelTo(Carbon::parse('2026-10-07 12:00:00', 'UTC'));
+        $user = User::factory()->create();
+        $this->actingAs($user);
+        $input = [
+            'birth_date' => '1996-05-01',
+            'height_cm' => 175,
+            'weight_kg' => 70,
+            'sex' => 'male',
+            'body_build' => 'lean',
+            'goal' => 'lose',
+            'activity_minutes' => 30,
+            'activity_type' => 'daily',
+            'timezone' => 'Asia/Jakarta',
+        ];
+
+        foreach ([[null, 1730], [68, 1700], [60, 1610], [45, 1480]] as [$goalWeight, $calories]) {
+            $this->postJson('/api/v1/target-estimates', [...$input, 'goal_weight_kg' => $goalWeight])
+                ->assertOk()
+                ->assertJsonPath('data.targets.calories', $calories);
+        }
+
+        $this->postJson('/api/v1/target-estimates', [...$input, 'goal_weight_kg' => 70])
+            ->assertUnprocessable()
+            ->assertJsonValidationErrors('goal_weight_kg');
+        $this->postJson('/api/v1/target-estimates', [...$input, 'goal' => 'gain', 'goal_weight_kg' => 65])
+            ->assertUnprocessable()
+            ->assertJsonValidationErrors('goal_weight_kg');
+
+        $oldTargets = $this->postJson('/api/v1/target-estimates', $input)->json('data.targets');
+        $setup = [...$input, 'name' => 'Ayu', 'unit_system' => 'metric', 'goal_weight_kg' => 60, 'target_source' => 'estimated', 'targets' => $oldTargets];
+        $this->putJson('/api/v1/me/setup', $setup)->assertOk();
+        $this->assertDatabaseHas('nutrient_targets', ['user_id' => $user->id, 'calories' => 1610, 'formula_version' => 'v2']);
+
+        $this->putJson('/api/v1/me/setup', [...$setup, 'target_source' => 'edited', 'targets' => [...$oldTargets, 'calories' => 1800]])->assertOk();
+        $this->assertDatabaseHas('nutrient_targets', ['user_id' => $user->id, 'calories' => 1800, 'source' => 'edited']);
+    }
+
     public function test_invalid_setup_saves_nothing(): void
     {
         $user = User::factory()->create();

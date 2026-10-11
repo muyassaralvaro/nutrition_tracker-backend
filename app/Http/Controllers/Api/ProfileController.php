@@ -27,10 +27,10 @@ class ProfileController extends Controller
             'weight_kg' => ['required', 'numeric', 'between:20,500'],
         ]);
 
-        return ['data' => ['targets' => $calculator->estimate($data), 'formula_version' => 'v1']];
+        return ['data' => ['targets' => $calculator->estimate($data), 'formula_version' => NutritionCalculator::FORMULA_VERSION]];
     }
 
-    public function setup(Request $request): array
+    public function setup(Request $request, NutritionCalculator $calculator): array
     {
         $data = $request->validate([
             ...$this->profileRules($request, true),
@@ -40,16 +40,17 @@ class ProfileController extends Controller
         ]);
 
         $today = now($data['timezone'])->toDateString();
+        $targets = $data['target_source'] === 'estimated' ? $calculator->estimate($data) : $data['targets'];
 
-        DB::transaction(function () use ($request, $data, $today): void {
+        DB::transaction(function () use ($request, $data, $today, $targets): void {
             $user = $request->user();
             $user->update(['name' => $data['name']]);
             $user->profile()->updateOrCreate([], Arr::only($data, self::PROFILE_FIELDS));
             $user->weights()->updateOrCreate(['entry_date' => $today], ['kg' => $data['weight_kg']]);
             $user->targets()->updateOrCreate(['effective_on' => $today], [
-                ...$data['targets'],
+                ...$targets,
                 'source' => $data['target_source'],
-                'formula_version' => 'v1',
+                'formula_version' => NutritionCalculator::FORMULA_VERSION,
             ]);
         });
 
@@ -82,7 +83,11 @@ class ProfileController extends Controller
             'body_build' => ['required', Rule::in(['lean', 'soft', 'stocky', 'muscular'])],
             'body_fat_percent' => ['nullable', 'numeric', 'between:3,70'],
             'goal' => ['required', Rule::in(['lose', 'maintain', 'gain'])],
-            'goal_weight_kg' => ['nullable', 'numeric', 'between:20,500'],
+            'goal_weight_kg' => [
+                'nullable', 'numeric', 'between:20,500',
+                ...($request->filled('weight_kg') && $request->input('goal') === 'lose' ? ['lt:weight_kg'] : []),
+                ...($request->filled('weight_kg') && $request->input('goal') === 'gain' ? ['gt:weight_kg'] : []),
+            ],
             'activity_minutes' => ['required', 'integer', 'between:0,240'],
             'activity_type' => ['required', Rule::in(['daily', 'cardio', 'strength', 'mixed'])],
             'timezone' => ['required', 'timezone'],
