@@ -54,6 +54,10 @@ return [
 
     'url' => env('APP_URL', 'http://localhost'),
 
+    'trusted_proxies' => env('TRUSTED_PROXIES'),
+
+    'developer_account' => env('DEVELOPER_ACCOUNT'),
+
     'account_deletion_ledger_path' => env('ACCOUNT_DELETION_LEDGER_PATH') ?: storage_path('app/private/account-deletions.jsonl'),
 
     /*

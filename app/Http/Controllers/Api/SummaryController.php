@@ -51,9 +51,11 @@ class SummaryController extends Controller
             $days[] = [
                 'date' => $date,
                 'status' => $nutrition['status'],
+                'has_target' => $target !== null,
                 'unknown_nutrients' => array_keys(array_filter($nutrition['known'], fn ($known) => ! $known)),
                 'meal_count' => $dayMeals->count(),
                 'calories' => $nutrition['totals']['calories'],
+                'calorie_warning' => $target !== null && $nutrition['known']['calories'] && $nutrition['totals']['calories'] > $target->calories && $nutrition['totals']['calories'] <= $target->calories * 1.05,
                 'weight_kg' => $weights->get($date)?->kg,
             ];
         }

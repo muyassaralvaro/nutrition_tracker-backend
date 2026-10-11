@@ -11,6 +11,8 @@ use App\NutritionCalculator;
 use Illuminate\Foundation\Testing\LazilyRefreshDatabase;
 use Illuminate\Http\Client\Request as ClientRequest;
 use Illuminate\Http\UploadedFile;
+use Illuminate\Routing\Middleware\ThrottleRequests;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Storage;
@@ -58,6 +60,60 @@ class MealAnalysisApiTest extends TestCase
         $this->postJson('/api/v1/meal-analyses', ['image' => UploadedFile::fake()->image('plate.jpg', 640, 480)])
             ->assertStatus(503)->assertJsonPath('code', 'provider_unavailable');
         $this->assertDatabaseCount('meal_analyses', 0);
+    }
+
+    public function test_text_only_estimate_uses_user_serving_and_requires_confirmation_before_saving(): void
+    {
+        config()->set('ai.nutrition_enabled', true);
+        config()->set('ai.providers.nine_router.url', 'https://example.test/v1');
+        config()->set('ai.providers.nine_router.key', 'test-key');
+        config()->set('ai.providers.nine_router.models.text.default', 'test-model');
+        Queue::fake([AnalyzeMealPhoto::class]);
+        $user = User::factory()->create();
+        $this->actingAs($user);
+
+        $this->postJson('/api/v1/meal-analyses', ['description' => 'with coconut milk'])
+            ->assertUnprocessable()->assertJsonValidationErrors('name');
+        $this->postJson('/api/v1/meal-analyses', ['name' => 'Nasi uduk', 'grams' => 2001])
+            ->assertUnprocessable()->assertJsonValidationErrors('grams');
+        $this->postJson('/api/v1/meal-analyses', ['name' => 'Nasi uduk', 'image' => UploadedFile::fake()->image('plate.jpg', 640, 480)])
+            ->assertUnprocessable()->assertJsonValidationErrors('image');
+
+        $id = $this->postJson('/api/v1/meal-analyses', [
+            'name' => ' Nasi uduk ', 'description' => ' coconut rice with egg ', 'grams' => 250, 'language' => 'id',
+        ])->assertAccepted()->assertJsonPath('data.image_url', null)->json('data.id');
+        Queue::assertPushed(AnalyzeMealPhoto::class, fn (AnalyzeMealPhoto $job) => $job->textDetails === [
+            'name' => 'Nasi uduk', 'description' => 'coconut rice with egg', 'grams' => 250.0,
+        ]);
+        MealPhotoAgent::fake([[
+            'title' => 'Nasi uduk', 'description' => 'Nasi gurih dengan telur', 'grams' => 200,
+            'nutrients' => ['calories' => 450, 'protein' => 15, 'carbs' => 65, 'fat' => 14, 'fiber' => null, 'sodium' => null, 'potassium' => null, 'calcium' => null, 'iron' => null],
+        ]]);
+
+        (new AnalyzeMealPhoto($id, '', ['name' => 'Nasi uduk', 'description' => 'coconut rice with egg', 'grams' => 250.0]))
+            ->handle(app(NutritionCalculator::class));
+
+        MealPhotoAgent::assertPrompted(fn ($prompt) => $prompt->contains('No photo was supplied') && $prompt->contains('Nasi uduk') && $prompt->contains('Indonesian only'));
+        $this->getJson('/api/v1/meal-analyses/'.$id)->assertOk()
+            ->assertJsonPath('data.draft.items.0.grams', 250)
+            ->assertJsonPath('data.draft.items.0.nutrients.calories', 562.5);
+        $this->assertDatabaseCount('meals', 0);
+
+        $this->postJson('/api/v1/meals', [
+            'client_request_id' => (string) Str::uuid(), 'analysis_id' => $id, 'meal_date' => now()->toDateString(),
+            'meal_time' => '12:30', 'title' => 'Nasi uduk',
+            'items' => [['name' => 'Nasi uduk', 'description' => 'Nasi gurih dengan telur', 'grams' => 250, 'nutrients' => [
+                'calories' => 450, 'protein' => 15, 'carbs' => 65, 'fat' => 14,
+            ]]],
+        ])->assertCreated()->assertJsonPath('data.source', 'manual');
+        $this->assertDatabaseMissing('meal_analyses', ['id' => $id]);
+
+        $nameOnly = $this->postJson('/api/v1/meal-analyses', ['name' => 'Soto ayam'])
+            ->assertAccepted()->json('data.id');
+        Queue::assertPushed(AnalyzeMealPhoto::class, fn (AnalyzeMealPhoto $job) => $job->analysisId === $nameOnly && $job->textDetails === [
+            'name' => 'Soto ayam', 'description' => '', 'grams' => null,
+        ]);
+        $this->deleteJson('/api/v1/meal-analyses/'.$nameOnly)->assertNoContent();
     }
 
     public function test_user_dish_details_omit_unrelated_confirmed_dishes_from_the_prompt(): void
@@ -141,11 +197,13 @@ class MealAnalysisApiTest extends TestCase
         ];
         $saved = $this->postJson('/api/v1/meals', $meal)->assertCreated();
         $thumbnailUrl = $saved->json('data.thumbnail_url');
-        $this->assertSame('/api/v1/meals/'.$saved->json('data.id').'/thumbnail', $thumbnailUrl);
         $thumbnailPath = $user->meals()->firstOrFail()->thumbnail_path;
+        $this->assertSame('/api/v1/meals/'.$saved->json('data.id').'/thumbnail?v='.basename($thumbnailPath), $thumbnailUrl);
         Storage::disk('local')->assertExists($thumbnailPath);
         $this->assertSame([240, 240], array_slice(getimagesizefromstring(Storage::disk('local')->get($thumbnailPath)), 0, 2));
-        $this->get($thumbnailUrl)->assertOk()->assertHeader('Content-Type', 'image/jpeg')->assertHeader('Cache-Control', 'no-store, private');
+        $this->get($thumbnailUrl)->assertOk()->assertHeader('Content-Type', 'image/jpeg')->assertHeader('Cache-Control', 'immutable, max-age=3600, private');
+        $this->get('/api/v1/meals/'.$saved->json('data.id').'/thumbnail')->assertOk()->assertHeader('Cache-Control', 'no-store, private');
+        $this->get('/api/v1/meals/'.$saved->json('data.id').'/thumbnail?v=outdated.jpg')->assertNotFound();
         $this->getJson('/api/v1/days/'.now()->toDateString())->assertJsonPath('data.meals.0.thumbnail_url', $thumbnailUrl);
         $this->postJson('/api/v1/meals', $meal)->assertOk()->assertJsonPath('data.thumbnail_url', $thumbnailUrl);
         $this->assertDatabaseCount('meals', 1);
@@ -212,6 +270,130 @@ class MealAnalysisApiTest extends TestCase
         $this->getJson('/api/v1/meal-analyses/'.$first)->assertJsonPath('data.draft.items.0.nutrients.calories', 300);
         $this->getJson('/api/v1/meal-analyses/'.$second)->assertJsonPath('data.error_code', 'quota_exhausted');
         $this->assertDatabaseHas('ai_usage_days', ['attempts' => 1]);
+    }
+
+    public function test_daily_analysis_and_per_meal_regeneration_limits_survive_draft_deletion(): void
+    {
+        $this->travelTo(Carbon::parse('2026-10-09 12:00:00', 'UTC'));
+        $this->withoutMiddleware(ThrottleRequests::class);
+        config()->set('ai.nutrition_enabled', true);
+        config()->set('ai.providers.nine_router.url', 'https://example.test/v1');
+        config()->set('ai.providers.nine_router.key', 'test-key');
+        config()->set('ai.providers.nine_router.models.text.default', 'test-model');
+        Queue::fake();
+        $this->getJson('/api/v1/me/analysis-quota')->assertUnauthorized();
+        $user = User::factory()->create();
+        $this->actingAs($user);
+
+        $this->getJson('/api/v1/me/analysis-quota')->assertJsonPath('data.daily_remaining', 7)
+            ->assertJsonPath('data.date', '2026-10-09')
+            ->assertJsonPath('data.resets_at', '2026-10-10T00:00:00+07:00');
+        $first = null;
+        for ($number = 0; $number < 7; $number++) {
+            $id = $this->postJson('/api/v1/meal-analyses', ['name' => 'Meal '.$number])
+                ->assertAccepted()->json('data.id');
+            $first ??= $id;
+            $this->deleteJson('/api/v1/meal-analyses/'.$id)->assertNoContent();
+        }
+        $this->getJson('/api/v1/me/analysis-quota')->assertJsonPath('data.daily_used', 7)->assertJsonPath('data.daily_remaining', 0);
+        $this->postJson('/api/v1/meal-analyses', ['name' => 'Eighth meal'])->assertStatus(429)->assertJsonPath('code', 'daily_analysis_limit');
+
+        for ($attempt = 1; $attempt <= 2; $attempt++) {
+            $id = $this->postJson('/api/v1/meal-analyses', ['name' => 'Meal 0', 'retry_of' => $first])
+                ->assertAccepted()->json('data.id');
+            $this->deleteJson('/api/v1/meal-analyses/'.$id)->assertNoContent();
+            $this->getJson('/api/v1/me/analysis-quota?analysis_id='.$first)
+                ->assertJsonPath('data.regenerations_used', $attempt)
+                ->assertJsonPath('data.regenerations_remaining', 2 - $attempt);
+        }
+        $this->postJson('/api/v1/meal-analyses', ['name' => 'Meal 0', 'retry_of' => $first])
+            ->assertStatus(429)->assertJsonPath('code', 'regeneration_limit');
+        $this->actingAs(User::factory()->create())->getJson('/api/v1/me/analysis-quota?analysis_id='.$first)->assertNotFound();
+
+        $this->travelTo(Carbon::parse('2026-10-09 16:59:00', 'UTC'));
+        $this->actingAs($user)->getJson('/api/v1/me/analysis-quota')->assertJsonPath('data.daily_remaining', 0);
+        $this->travelTo(Carbon::parse('2026-10-09 17:01:00', 'UTC'));
+        $this->getJson('/api/v1/me/analysis-quota')->assertJsonPath('data.daily_remaining', 7)
+            ->assertJsonPath('data.date', '2026-10-10')
+            ->assertJsonPath('data.resets_at', '2026-10-11T00:00:00+07:00');
+        $this->postJson('/api/v1/meal-analyses', ['name' => 'Next day meal'])->assertAccepted();
+        $this->assertDatabaseHas('meal_analysis_usage', ['user_id' => $user->id, 'usage_date' => '2026-10-10', 'is_regeneration' => false]);
+    }
+
+    public function test_google_developer_account_can_exceed_daily_and_regeneration_limits(): void
+    {
+        $this->withoutMiddleware(ThrottleRequests::class);
+        config()->set('app.developer_account', 'Developer@Example.test');
+        config()->set('ai.nutrition_enabled', true);
+        config()->set('ai.providers.nine_router.url', 'https://example.test/v1');
+        config()->set('ai.providers.nine_router.key', 'test-key');
+        config()->set('ai.providers.nine_router.models.text.default', 'test-model');
+        Queue::fake();
+        $this->actingAs(User::factory()->create(['email' => 'account@example.test', 'google_subject' => 'google-developer', 'google_email' => 'developer@example.test']));
+
+        $this->getJson('/api/v1/me/analysis-quota')->assertOk()
+            ->assertJsonPath('data.unlimited', true)
+            ->assertJsonPath('data.daily_limit', null)
+            ->assertJsonPath('data.daily_remaining', null);
+
+        $first = null;
+        for ($number = 0; $number < 8; $number++) {
+            $id = $this->postJson('/api/v1/meal-analyses', ['name' => 'Meal '.$number])->assertAccepted()->json('data.id');
+            $first ??= $id;
+            $this->deleteJson('/api/v1/meal-analyses/'.$id)->assertNoContent();
+        }
+
+        for ($number = 0; $number < 3; $number++) {
+            $id = $this->postJson('/api/v1/meal-analyses', ['name' => 'Meal 0', 'retry_of' => $first])->assertAccepted()->json('data.id');
+            $this->deleteJson('/api/v1/meal-analyses/'.$id)->assertNoContent();
+        }
+
+        $this->getJson('/api/v1/me/analysis-quota?analysis_id='.$first)->assertOk()
+            ->assertJsonPath('data.daily_used', 8)
+            ->assertJsonPath('data.regenerations_used', 3)
+            ->assertJsonPath('data.regeneration_limit', null)
+            ->assertJsonPath('data.regenerations_remaining', null);
+        $this->postJson('/api/v1/meal-analyses', ['name' => 'Different meal', 'retry_of' => $first])
+            ->assertUnprocessable()->assertJsonPath('code', 'different_meal');
+
+        config()->set('app.developer_account', null);
+        $this->getJson('/api/v1/me/analysis-quota')->assertJsonPath('data.unlimited', false)->assertJsonPath('data.daily_remaining', 0);
+        $this->postJson('/api/v1/meal-analyses', ['name' => 'Another meal'])
+            ->assertStatus(429)->assertJsonPath('code', 'daily_analysis_limit');
+    }
+
+    public function test_matching_email_without_google_identity_is_not_a_developer_account(): void
+    {
+        config()->set('app.developer_account', 'developer@example.test');
+        $this->actingAs(User::factory()->create(['email' => 'developer@example.test']));
+
+        $this->getJson('/api/v1/me/analysis-quota')->assertOk()
+            ->assertJsonPath('data.unlimited', false)
+            ->assertJsonPath('data.daily_limit', 7)
+            ->assertJsonPath('data.daily_remaining', 7);
+    }
+
+    public function test_photo_regeneration_requires_the_same_photo_even_after_draft_deletion(): void
+    {
+        config()->set('ai.nutrition_enabled', true);
+        config()->set('ai.providers.nine_router.url', 'https://example.test/v1');
+        config()->set('ai.providers.nine_router.key', 'test-key');
+        config()->set('ai.providers.nine_router.models.text.default', 'test-model');
+        Storage::fake('local');
+        Queue::fake();
+        $this->actingAs(User::factory()->create());
+        $first = $this->postJson('/api/v1/meal-analyses', ['image' => UploadedFile::fake()->image('plate.jpg', 640, 480)])
+            ->assertAccepted()->json('data.id');
+        $this->deleteJson('/api/v1/meal-analyses/'.$first)->assertNoContent();
+
+        $this->postJson('/api/v1/meal-analyses', [
+            'image' => UploadedFile::fake()->image('different.jpg', 700, 480), 'retry_of' => $first,
+        ])->assertUnprocessable()->assertJsonPath('code', 'different_meal');
+        $this->postJson('/api/v1/meal-analyses', [
+            'image' => UploadedFile::fake()->image('same.jpg', 640, 480), 'retry_of' => $first,
+        ])->assertAccepted();
+        $this->getJson('/api/v1/me/analysis-quota?analysis_id='.$first)
+            ->assertJsonPath('data.daily_used', 1)->assertJsonPath('data.regenerations_used', 1);
     }
 
     public function test_chinese_model_text_is_rejected_before_reaching_the_review(): void

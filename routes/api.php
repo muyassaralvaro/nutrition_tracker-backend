@@ -9,7 +9,7 @@ use App\Http\Controllers\Api\TargetController;
 use App\Http\Controllers\Api\WeightController;
 use Illuminate\Support\Facades\Route;
 
-Route::prefix('v1')->middleware('auth:sanctum')->group(function (): void {
+Route::prefix('v1')->middleware(['auth:sanctum', 'throttle:120,1,api:'])->group(function (): void {
     Route::get('me', [AuthController::class, 'me']);
     Route::get('me/avatar', [AuthController::class, 'avatar'])->name('me.avatar');
     Route::put('me/avatar', [AuthController::class, 'updateAvatar']);
@@ -32,6 +32,7 @@ Route::prefix('v1')->middleware('auth:sanctum')->group(function (): void {
     Route::put('meals/{id}', [MealController::class, 'update']);
     Route::delete('meals/{id}', [MealController::class, 'destroy']);
 
+    Route::get('me/analysis-quota', [MealAnalysisController::class, 'quota']);
     Route::post('meal-analyses', [MealAnalysisController::class, 'store'])->middleware('throttle:5,1');
     Route::get('meal-analyses/{id}', [MealAnalysisController::class, 'show']);
     Route::get('meal-analyses/{id}/image', [MealAnalysisController::class, 'image'])->name('meal-analyses.image');

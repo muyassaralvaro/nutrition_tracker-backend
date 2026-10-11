@@ -34,14 +34,17 @@ class GoogleAvatarAuthTest extends TestCase
         Socialite::shouldReceive('driver')->twice()->with('google')->andReturn($provider);
 
         $this->getJson('/api/v1/me/avatar')->assertUnauthorized();
-        $this->get('/api/v1/auth/google/callback')->assertRedirect('http://localhost:3000/home');
+        $this->withSession(['google_signup_consent' => true])->get('/api/v1/auth/google/callback')->assertRedirect('http://localhost:3000/home');
         $user = User::where('google_subject', 'google-123')->sole();
+        $this->assertSame('google@example.test', $user->google_email);
+        $this->assertNotNull($user->accepted_terms_at);
         $googlePath = $user->avatar_path;
         $this->assertNotNull($googlePath);
         Storage::disk('local')->assertExists($googlePath);
         $this->assertSame([256, 256], array_slice(getimagesizefromstring(Storage::disk('local')->get($googlePath)), 0, 2));
         $this->getJson('/api/v1/me')->assertOk()->assertJsonPath('data.avatar_url', '/api/v1/me/avatar?v='.basename($googlePath));
         $this->get('/api/v1/me/avatar')->assertOk()->assertHeader('Content-Type', 'image/jpeg')->assertHeader('Cache-Control', 'no-store, private');
+        $this->get('/api/v1/me/avatar?v='.basename($googlePath))->assertOk()->assertHeader('Cache-Control', 'immutable, max-age=3600, private');
 
         $changed = $this->putJson('/api/v1/me/avatar', ['image' => UploadedFile::fake()->image('mine.png', 400, 400)])->assertOk();
         $customPath = $user->fresh()->avatar_path;
@@ -49,6 +52,8 @@ class GoogleAvatarAuthTest extends TestCase
         Storage::disk('local')->assertMissing($googlePath);
         Storage::disk('local')->assertExists($customPath);
         $changed->assertJsonPath('data.avatar_url', '/api/v1/me/avatar?v='.basename($customPath));
+        $this->get('/api/v1/me/avatar?v='.basename($googlePath))->assertNotFound();
+        $this->get($changed->json('data.avatar_url'))->assertOk()->assertHeader('Cache-Control', 'immutable, max-age=3600, private');
         $this->putJson('/api/v1/me/avatar', ['image' => UploadedFile::fake()->create('broken.jpg', 10, 'image/jpeg')])
             ->assertUnprocessable()->assertJsonValidationErrors('image');
         $this->assertSame($customPath, $user->fresh()->avatar_path);
@@ -80,7 +85,7 @@ class GoogleAvatarAuthTest extends TestCase
         $this->actingAs($user->fresh(), 'web')
             ->getJson('/api/v1/me')->assertOk()->assertJsonPath('data.avatar_url', '/api/v1/me/avatar?v='.basename($user->fresh()->avatar_path));
         Storage::disk('local')->assertExists($user->fresh()->avatar_path);
-        $this->assertDatabaseHas('users', ['id' => $user->id, 'google_subject' => 'google-456']);
+        $this->assertDatabaseHas('users', ['id' => $user->id, 'google_subject' => 'google-456', 'google_email' => $user->email]);
     }
 
     public function test_google_photo_must_use_https_and_googleusercontent_host(): void
@@ -96,7 +101,7 @@ class GoogleAvatarAuthTest extends TestCase
         );
         Socialite::shouldReceive('driver')->twice()->with('google')->andReturn($provider);
 
-        $this->get('/api/v1/auth/google/callback')->assertRedirect();
+        $this->withSession(['google_signup_consent' => true])->get('/api/v1/auth/google/callback')->assertRedirect();
         $this->assertDatabaseHas('users', ['google_subject' => 'google-789', 'avatar_path' => null]);
 
         $this->get('/api/v1/auth/google/callback')->assertRedirect();
@@ -115,7 +120,107 @@ class GoogleAvatarAuthTest extends TestCase
         ]));
         Socialite::shouldReceive('driver')->once()->with('google')->andReturn($provider);
 
-        $this->get('/api/v1/auth/google/callback')->assertRedirect();
+        $this->withSession(['google_signup_consent' => true])->get('/api/v1/auth/google/callback')->assertRedirect();
         $this->getJson('/api/v1/me')->assertOk()->assertJsonPath('data.avatar_url', null);
+    }
+
+    public function test_new_google_account_requires_consent_and_records_acceptance(): void
+    {
+        config()->set('services.google.client_id', 'test-id');
+        config()->set('services.google.client_secret', 'test-secret');
+        config()->set('services.frontend.url', 'http://localhost:3000');
+        $provider = Mockery::mock(Provider::class);
+        $provider->shouldReceive('user')->twice()->andReturn(GoogleUser::fake([
+            'id' => 'google-new', 'email' => 'new@example.test', 'avatar' => null,
+        ]));
+        Socialite::shouldReceive('driver')->twice()->with('google')->andReturn($provider);
+
+        $this->get('/api/v1/auth/google/callback')->assertRedirect('http://localhost:3000/login?oauth=consent_required');
+        $this->assertDatabaseMissing('users', ['google_subject' => 'google-new']);
+
+        $this->withSession(['google_signup_consent' => true])->get('/api/v1/auth/google/callback')->assertRedirect('http://localhost:3000/home');
+        $this->assertNotNull(User::where('google_subject', 'google-new')->sole()->accepted_terms_at);
+    }
+
+    public function test_google_registration_redirect_remembers_consent_for_callback(): void
+    {
+        config()->set('services.google.client_id', 'test-id');
+        config()->set('services.google.client_secret', 'test-secret');
+        $provider = Mockery::mock(Provider::class);
+        $provider->shouldReceive('redirect')->once()->andReturn(redirect('https://accounts.google.com'));
+        Socialite::shouldReceive('driver')->once()->with('google')->andReturn($provider);
+
+        $this->get('/api/v1/auth/google/redirect?consent=1')
+            ->assertRedirect('https://accounts.google.com')
+            ->assertSessionHas('google_signup_consent', true);
+    }
+
+    public function test_new_google_accounts_are_limited_by_ip_without_blocking_existing_sign_in(): void
+    {
+        config()->set('services.google.client_id', 'test-id');
+        config()->set('services.google.client_secret', 'test-secret');
+        config()->set('services.frontend.url', 'http://localhost:3000');
+        $provider = Mockery::mock(Provider::class);
+        $provider->shouldReceive('user')->times(5)->andReturn(
+            ...array_map(fn (int $number) => GoogleUser::fake([
+                'id' => 'google-ip-'.$number, 'email' => 'ip-'.$number.'@example.test', 'avatar' => null,
+            ]), [1, 2, 3, 4, 1]),
+        );
+        Socialite::shouldReceive('driver')->times(5)->with('google')->andReturn($provider);
+
+        for ($number = 1; $number <= 3; $number++) {
+            $this->withSession(['google_signup_consent' => true])->get('/api/v1/auth/google/callback')->assertRedirect('http://localhost:3000/home');
+        }
+        $this->withSession(['google_signup_consent' => true])->get('/api/v1/auth/google/callback')
+            ->assertRedirect('http://localhost:3000/login?oauth=signup_limited');
+        $this->assertDatabaseCount('users', 3);
+        $this->get('/api/v1/auth/google/callback')->assertRedirect('http://localhost:3000/home');
+    }
+
+    public function test_developer_google_signup_bypasses_full_ip_allowance_without_refilling_it(): void
+    {
+        config()->set('app.developer_account', 'Developer@Example.test');
+        config()->set('services.google.client_id', 'test-id');
+        config()->set('services.google.client_secret', 'test-secret');
+        config()->set('services.frontend.url', 'http://localhost:3000');
+        $this->withServerVariables(['REMOTE_ADDR' => '198.51.100.37']);
+        $provider = Mockery::mock(Provider::class);
+        $googleUsers = array_map(fn (int $number) => GoogleUser::fake([
+            'id' => 'google-signup-'.$number, 'email' => 'signup-'.$number.'@example.test', 'avatar' => null,
+        ]), [1, 2, 3]);
+        $googleUsers[] = GoogleUser::fake(['id' => 'google-developer', 'email' => 'developer@example.test', 'avatar' => null]);
+        $googleUsers[] = GoogleUser::fake(['id' => 'google-signup-4', 'email' => 'signup-4@example.test', 'avatar' => null]);
+        $provider->shouldReceive('user')->times(5)->andReturn(...$googleUsers);
+        Socialite::shouldReceive('driver')->times(5)->with('google')->andReturn($provider);
+
+        for ($number = 0; $number < 3; $number++) {
+            $this->withSession(['google_signup_consent' => true])->get('/api/v1/auth/google/callback')->assertRedirect('http://localhost:3000/home');
+        }
+        $this->withSession(['google_signup_consent' => true])->get('/api/v1/auth/google/callback')->assertRedirect('http://localhost:3000/home');
+        $this->getJson('/api/v1/me/analysis-quota')->assertOk()->assertJsonPath('data.unlimited', true);
+        $this->withSession(['google_signup_consent' => true])->get('/api/v1/auth/google/callback')
+            ->assertRedirect('http://localhost:3000/login?oauth=signup_limited');
+        $this->assertDatabaseCount('users', 4);
+        $this->assertDatabaseHas('users', ['email' => 'developer@example.test', 'google_subject' => 'google-developer', 'google_email' => 'developer@example.test']);
+    }
+
+    public function test_google_login_records_actual_google_email_for_developer_check(): void
+    {
+        config()->set('app.developer_account', 'developer@example.test');
+        config()->set('services.google.client_id', 'test-id');
+        config()->set('services.google.client_secret', 'test-secret');
+        config()->set('services.frontend.url', 'http://localhost:3000');
+        $user = User::factory()->create(['email' => 'developer@example.test', 'google_subject' => 'google-other']);
+        $provider = Mockery::mock(Provider::class);
+        $provider->shouldReceive('user')->once()->andReturn(GoogleUser::fake([
+            'id' => 'google-other', 'email' => 'other@example.test', 'avatar' => null,
+        ]));
+        Socialite::shouldReceive('driver')->once()->with('google')->andReturn($provider);
+
+        $this->actingAs($user)->getJson('/api/v1/me/analysis-quota')->assertOk()->assertJsonPath('data.unlimited', false);
+        $this->get('/api/v1/auth/google/callback')->assertRedirect('http://localhost:3000/home');
+        $this->assertSame('developer@example.test', $user->fresh()->email);
+        $this->assertSame('other@example.test', $user->fresh()->google_email);
+        $this->getJson('/api/v1/me/analysis-quota')->assertOk()->assertJsonPath('data.unlimited', false);
     }
 }
