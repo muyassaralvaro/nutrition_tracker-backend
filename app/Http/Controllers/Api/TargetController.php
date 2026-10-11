@@ -36,7 +36,7 @@ class TargetController extends Controller
         $target = $request->user()->targets()->updateOrCreate(['effective_on' => $date], [
             ...$data,
             'source' => $source,
-            'formula_version' => 'v1',
+            'formula_version' => NutritionCalculator::FORMULA_VERSION,
         ]);
 
         return ['data' => $target];

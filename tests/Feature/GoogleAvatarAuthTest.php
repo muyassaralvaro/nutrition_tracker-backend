@@ -34,6 +34,7 @@ class GoogleAvatarAuthTest extends TestCase
         Socialite::shouldReceive('driver')->twice()->with('google')->andReturn($provider);
 
         $this->getJson('/api/v1/me/avatar')->assertUnauthorized();
+        $this->get('/api/v1/me/avatar')->assertUnauthorized();
         $this->withSession(['google_signup_consent' => true])->get('/api/v1/auth/google/callback')->assertRedirect('http://localhost:3000/home');
         $user = User::where('google_subject', 'google-123')->sole();
         $this->assertSame('google@example.test', $user->google_email);
