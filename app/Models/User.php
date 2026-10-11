@@ -12,12 +12,24 @@ use Illuminate\Database\Eloquent\Relations\HasOne;
 use Illuminate\Foundation\Auth\User as Authenticatable;
 use Illuminate\Notifications\Notifiable;
 
-#[Fillable(['name', 'email', 'password', 'phone_e164', 'google_subject', 'avatar_path'])]
-#[Hidden(['password', 'remember_token', 'google_subject'])]
+#[Fillable(['name', 'email', 'password', 'phone_e164', 'google_subject', 'google_email', 'avatar_path', 'accepted_terms_at'])]
+#[Hidden(['password', 'remember_token', 'google_subject', 'google_email'])]
 class User extends Authenticatable
 {
     /** @use HasFactory<UserFactory> */
     use HasFactory, Notifiable;
+
+    public static function matchesDeveloperEmail(?string $email): bool
+    {
+        $configured = trim((string) config('app.developer_account'));
+
+        return $configured !== '' && $email !== null && strcasecmp(trim($email), $configured) === 0;
+    }
+
+    public function isDeveloperAccount(): bool
+    {
+        return $this->google_subject !== null && $this->google_subject !== '' && self::matchesDeveloperEmail($this->google_email);
+    }
 
     public function profile(): HasOne
     {
@@ -53,6 +65,7 @@ class User extends Authenticatable
     {
         return [
             'email_verified_at' => 'datetime',
+            'accepted_terms_at' => 'datetime',
             'password' => 'hashed',
         ];
     }

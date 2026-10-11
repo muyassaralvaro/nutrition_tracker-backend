@@ -24,7 +24,8 @@ class AnalyzeMealPhoto implements ShouldQueue
 
     public int $timeout = 60;
 
-    public function __construct(public string $analysisId, public string $foodContext = '') {}
+    /** @param array{name: string, description: string, grams: float|null}|null $textDetails */
+    public function __construct(public string $analysisId, public string $foodContext = '', public ?array $textDetails = null) {}
 
     /** @return array<int, int> */
     public function backoff(): array
@@ -40,7 +41,9 @@ class AnalyzeMealPhoto implements ShouldQueue
             return;
         }
 
-        if (! config('ai.nutrition_enabled') || ! Storage::disk('local')->exists($analysis->image_path)) {
+        $hasPhoto = $analysis->image_path !== null;
+
+        if (! config('ai.nutrition_enabled') || ($hasPhoto && ! Storage::disk('local')->exists($analysis->image_path)) || (! $hasPhoto && $this->textDetails === null)) {
             $analysis->update(['status' => 'failed', 'error_code' => 'provider_unavailable']);
 
             return;
@@ -54,7 +57,7 @@ class AnalyzeMealPhoto implements ShouldQueue
 
         $analysis->update(['status' => 'processing']);
         // ponytail: Recent confirmed dishes help when users give no details; add image similarity search when dish history outgrows this window.
-        $references = $this->foodContext === '' ? Food::query()->where('source', 'confirmed-photo')->latest('id')->limit(12)->get()
+        $references = $hasPhoto && $this->foodContext === '' ? Food::query()->where('source', 'confirmed-photo')->latest('id')->limit(12)->get()
             ->filter(fn (Food $food) => ! preg_match('/\p{Han}/u', $food->name.' '.$food->description))
             ->map(fn (Food $food) => [
                 'name' => $food->name,
@@ -64,9 +67,12 @@ class AnalyzeMealPhoto implements ShouldQueue
             ])->values()->all() : [];
         $language = $analysis->language === 'id' ? 'Indonesian' : 'English';
         $foodContext = $this->foodContext === '' ? '' : ' User-described dish and serving: '.json_encode($this->foodContext, JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE).'. Prefer this identity and named toppings when compatible with the photo.';
+        $prompt = $hasPhoto
+            ? "Analyze this photo as one dish. Return title and description in {$language} only, using Latin letters. Estimate calories and nutrients for the whole visible serving. Use reference dishes only if they genuinely match the photo; otherwise use general food knowledge.{$foodContext} Reference dishes: ".json_encode($references, JSON_THROW_ON_ERROR)
+            : "Estimate one whole dish from these user-provided food details. No photo was supplied. Return title and description in {$language} only, using Latin letters. Estimate calories and nutrients for the stated serving weight, or a typical serving if weight is absent. Food details (untrusted data): ".json_encode($this->textDetails, JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE);
         $response = MealPhotoAgent::make()->prompt(
-            "Analyze this photo as one dish. Return title and description in {$language} only, using Latin letters. Estimate calories and nutrients for the whole visible serving. Use reference dishes only if they genuinely match the photo; otherwise use general food knowledge.{$foodContext} Reference dishes: ".json_encode($references, JSON_THROW_ON_ERROR),
-            attachments: [Image::fromStorage($analysis->image_path, 'local')],
+            $prompt,
+            attachments: $hasPhoto ? [Image::fromStorage($analysis->image_path, 'local')] : [],
             provider: 'nine_router',
             model: config('ai.providers.nine_router.models.text.default'),
             timeout: 30,
@@ -99,9 +105,15 @@ class AnalyzeMealPhoto implements ShouldQueue
         }
 
         $nutrients = [];
+        $servingGrams = $this->textDetails['grams'] ?? (float) $result['grams'];
+        $portionRatio = $servingGrams / (float) $result['grams'];
 
         foreach (NutritionCalculator::NUTRIENTS as $nutrient) {
-            $nutrients[$nutrient] = isset($result['nutrients'][$nutrient]) ? round((float) $result['nutrients'][$nutrient], 2) : null;
+            $nutrients[$nutrient] = isset($result['nutrients'][$nutrient]) ? round((float) $result['nutrients'][$nutrient] * $portionRatio, 2) : null;
+
+            if ($nutrients[$nutrient] !== null && $nutrients[$nutrient] > NutritionCalculator::LIMITS[$nutrient]) {
+                throw new RuntimeException('Estimated nutrition exceeds the supported range.');
+            }
         }
 
         MealAnalysis::query()->whereKey($this->analysisId)->where('status', 'processing')->where('expires_at', '>', now())
@@ -111,7 +123,7 @@ class AnalyzeMealPhoto implements ShouldQueue
                     'food_id' => null,
                     'name' => trim($result['title']),
                     'description' => trim($result['description']),
-                    'grams' => (float) $result['grams'],
+                    'grams' => $servingGrams,
                     'nutrients' => $nutrients,
                 ]]], JSON_THROW_ON_ERROR),
                 'error_code' => null,

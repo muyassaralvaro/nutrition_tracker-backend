@@ -101,19 +101,30 @@ class NutritionCalculator
             $status = 'empty';
         } elseif ($target === null) {
             $status = 'no_target';
-        } elseif (in_array(false, $known, true)) {
-            $status = 'partial';
         } else {
-            $complete = $totals['calories'] >= $target->calories * 0.9
-                && $totals['calories'] <= $target->calories * 1.1
-                && $totals['sodium'] <= $target->sodium;
+            // ponytail: Goal bands are planning thresholds; add clinician-reviewed upper limits for minerals if needed.
+            $over = $known['sodium'] && $totals['sodium'] > $target->sodium;
 
-            foreach (['protein', 'carbs', 'fat', 'fiber', 'potassium', 'calcium', 'iron'] as $nutrient) {
-                $complete = $complete && $totals[$nutrient] >= $target->{$nutrient} * 0.9;
+            foreach (['calories', 'protein', 'carbs', 'fat'] as $nutrient) {
+                if ($known[$nutrient] && $target->{$nutrient} > 0 && $totals[$nutrient] > $target->{$nutrient} * 1.05) {
+                    $over = true;
+                    break;
+                }
             }
 
-            if ($complete) {
+            if ($over) {
+                $status = 'over';
+            } elseif (in_array(false, $known, true)) {
+                $status = 'partial';
+            } else {
                 $status = 'complete';
+
+                foreach (['calories', 'protein', 'carbs', 'fat', 'fiber', 'potassium', 'calcium', 'iron'] as $nutrient) {
+                    if ($totals[$nutrient] < $target->{$nutrient} * 0.9) {
+                        $status = 'progress';
+                        break;
+                    }
+                }
             }
         }
 

@@ -17,10 +17,8 @@ class UserResource extends JsonResource
         return [
             'id' => $this->id,
             'name' => $this->name,
-            'phone_e164' => $this->phone_e164,
             'email' => $this->email,
             'avatar_url' => $this->avatar_path ? route('me.avatar', [], false).'?v='.basename($this->avatar_path) : null,
-            'has_password' => $this->password !== null,
         ];
     }
 }

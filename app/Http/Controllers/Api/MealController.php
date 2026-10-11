@@ -53,7 +53,7 @@ class MealController extends Controller
         if (! empty($data['analysis_id'])) {
             $analysis = $request->user()->analyses()->whereKey($data['analysis_id'])->where('expires_at', '>', now())->firstOrFail();
             abort_if($analysis->status === 'canceled', 422, 'Analysis was canceled.');
-            abort_if($analysis->status === 'succeeded' && (count($data['items']) !== 1 || empty(trim($data['items'][0]['description'] ?? ''))), 422, 'Confirm one dish and its description.');
+            abort_if($analysis->image_path && $analysis->status === 'succeeded' && (count($data['items']) !== 1 || empty(trim($data['items'][0]['description'] ?? ''))), 422, 'Confirm one dish and its description.');
         }
 
         // ponytail: Manual and older meals have no saved photo; add optional image upload when they need thumbnails.
@@ -71,12 +71,12 @@ class MealController extends Controller
                     'meal_date' => $data['meal_date'],
                     'meal_time' => $data['meal_time'],
                     'title' => $data['title'],
-                    'source' => $analysis ? 'photo' : 'manual',
+                    'source' => $analysis?->image_path ? 'photo' : 'manual',
                     'thumbnail_path' => $thumbnailPath,
                 ]);
 
                 $this->replaceItems($meal, $data['items']);
-                if ($analysis?->status === 'succeeded') {
+                if ($analysis?->image_path && $analysis->status === 'succeeded') {
                     $this->syncDishReference($meal, $data['items']);
                 }
                 $analysis?->delete();
@@ -115,10 +115,12 @@ class MealController extends Controller
     {
         $meal = $request->user()->meals()->findOrFail($id);
         abort_unless($meal->thumbnail_path && Storage::disk('local')->exists($meal->thumbnail_path), 404);
+        $version = $request->query('v');
+        abort_if($version !== null && $version !== basename($meal->thumbnail_path), 404);
 
         return response(Storage::disk('local')->get($meal->thumbnail_path), 200, [
             'Content-Type' => 'image/jpeg',
-            'Cache-Control' => 'private, no-store',
+            'Cache-Control' => $version === null ? 'private, no-store' : 'private, max-age=3600, immutable',
             'X-Content-Type-Options' => 'nosniff',
         ]);
     }

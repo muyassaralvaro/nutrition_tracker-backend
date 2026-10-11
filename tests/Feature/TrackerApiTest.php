@@ -15,30 +15,25 @@ class TrackerApiTest extends TestCase
 {
     use LazilyRefreshDatabase;
 
-    public function test_phone_registration_creates_a_session(): void
+    public function test_phone_and_password_routes_are_unavailable(): void
     {
-        $response = $this->postJson('/api/v1/auth/register', [
-            'name' => 'Ayu',
-            'phone_e164' => '+6281234567890',
-            'password' => 'secret123',
-            'password_confirmation' => 'secret123',
-        ]);
-
-        $response->assertCreated()->assertJsonPath('data.phone_e164', '+6281234567890');
-        $this->assertDatabaseHas('users', ['phone_e164' => '+6281234567890']);
-        $this->getJson('/api/v1/me')->assertOk()->assertJsonPath('data.name', 'Ayu');
+        $this->postJson('/api/v1/auth/register')->assertNotFound();
+        $this->postJson('/api/v1/auth/login')->assertNotFound();
+        $this->actingAs(User::factory()->create())->patchJson('/api/v1/me/password')->assertNotFound();
+        $this->getJson('/api/v1/auth/options')->assertOk()->assertJsonMissingPath('data.phone_registration_enabled');
     }
 
-    public function test_password_change_rejects_old_password_after_logout(): void
+    public function test_stateful_api_write_requires_csrf_token(): void
     {
-        User::factory()->create(['phone_e164' => '+6281234567892', 'password' => 'oldsecret123']);
-        $this->postJson('/api/v1/auth/login', ['phone_e164' => '+6281234567892', 'password' => 'oldsecret123'])->assertOk();
-        $this->patchJson('/api/v1/me/password', [
-            'current_password' => 'oldsecret123', 'password' => 'newsecret123', 'password_confirmation' => 'newsecret123',
-        ])->assertNoContent();
-        $this->postJson('/api/v1/auth/logout')->assertNoContent();
-        $this->postJson('/api/v1/auth/login', ['phone_e164' => '+6281234567892', 'password' => 'oldsecret123'])->assertUnprocessable();
-        $this->postJson('/api/v1/auth/login', ['phone_e164' => '+6281234567892', 'password' => 'newsecret123'])->assertOk();
+        config()->set('sanctum.stateful', ['nourish.my.id']);
+        $this->actingAs(User::factory()->create())
+            ->withSession(['_token' => 'test-token'])
+            ->withHeader('Origin', 'https://nourish.my.id');
+
+        $payload = ['entry_date' => now()->toDateString(), 'kg' => 70];
+        $this->postJson('/api/v1/me/weights', $payload)->assertStatus(419);
+        $this->withHeader('X-CSRF-TOKEN', 'test-token')
+            ->postJson('/api/v1/me/weights', $payload)->assertOk();
     }
 
     public function test_target_estimate_matches_frontend_formula(): void
@@ -123,7 +118,7 @@ class TrackerApiTest extends TestCase
             'protein' => 80, 'carbs' => 250, 'fat' => 60, 'fiber' => 25,
             'sodium' => 2300, 'potassium' => 2600, 'calcium' => 1000, 'iron' => 18,
         ];
-        $user->targets()->create(['effective_on' => '2024-02-01', ...$targets]);
+        $user->targets()->create(['effective_on' => '2024-02-15', ...$targets]);
         $user->targets()->create(['effective_on' => '2024-02-29', ...$targets, 'calories' => 2200]);
 
         foreach (['2024-02-28', '2024-02-29'] as $date) {
@@ -150,8 +145,52 @@ class TrackerApiTest extends TestCase
         $this->getJson('/api/v1/calendar?month=2024-02')->assertOk()
             ->assertJsonCount(29, 'data.days')
             ->assertJsonPath('data.completed_days', 1)
+            ->assertJsonPath('data.days.13.status', 'empty')
+            ->assertJsonPath('data.days.13.has_target', false)
+            ->assertJsonPath('data.days.14.status', 'empty')
+            ->assertJsonPath('data.days.14.has_target', true)
             ->assertJsonPath('data.days.28.status', 'partial');
         $this->getJson('/api/v1/days/2024-02-30')->assertUnprocessable();
+    }
+
+    public function test_day_and_calendar_distinguish_goal_range_and_overeating(): void
+    {
+        $user = User::factory()->create();
+        $this->actingAs($user);
+        $target = [
+            'calories' => 2000, 'protein' => 80, 'carbs' => 250, 'fat' => 60,
+            'fiber' => 25, 'sodium' => 2300, 'potassium' => 2600, 'calcium' => 1000, 'iron' => 18,
+        ];
+        $user->targets()->create(['effective_on' => '2024-03-01', 'source' => 'edited', 'formula_version' => 'v1', ...$target]);
+        $cases = [
+            '2024-03-01' => [['calories' => 1799], 'progress'],
+            '2024-03-02' => [['calories' => 1800], 'complete'],
+            '2024-03-03' => [['calories' => 2100], 'complete'],
+            '2024-03-04' => [['calories' => 2101], 'over'],
+            '2024-03-05' => [['protein' => 85], 'over'],
+            '2024-03-06' => [['sodium' => 2301], 'over'],
+            '2024-03-07' => [['calories' => 2300, 'fiber' => null], 'over'],
+            '2024-03-08' => [['protein' => 84], 'complete'],
+        ];
+
+        foreach ($cases as $date => [$overrides]) {
+            $meal = $user->meals()->create([
+                'client_request_id' => (string) Str::uuid(), 'create_payload_sha256' => str_repeat('0', 64),
+                'meal_date' => $date, 'meal_time' => '12:00', 'title' => 'Daily food', 'source' => 'manual',
+            ]);
+            $meal->items()->create(['position' => 0, 'name' => 'Daily food', ...$target, ...$overrides]);
+        }
+
+        foreach ($cases as $date => [, $status]) {
+            $this->getJson('/api/v1/days/'.$date)->assertOk()->assertJsonPath('data.nutrition.status', $status);
+        }
+        $this->getJson('/api/v1/calendar?month=2024-03')->assertOk()
+            ->assertJsonPath('data.completed_days', 3)
+            ->assertJsonPath('data.days.1.calorie_warning', false)
+            ->assertJsonPath('data.days.2.calorie_warning', true)
+            ->assertJsonPath('data.days.3.status', 'over')
+            ->assertJsonPath('data.days.3.calorie_warning', false)
+            ->assertJsonPath('data.days.6.status', 'over');
     }
 
     public function test_account_deletion_ledger_prevents_restore_from_resurrecting_account(): void
@@ -175,8 +214,10 @@ class TrackerApiTest extends TestCase
         $passwordHash = $user->password;
 
         try {
-            $this->actingAs($user)->withSession(['authenticated_at' => now()->timestamp])
-                ->deleteJson('/api/v1/me', ['password' => 'secret123'])->assertNoContent();
+            $this->actingAs($user)->withSession(['authenticated_at' => now()->timestamp, '_token' => 'delete-token'])
+                ->deleteJson('/api/v1/me')->assertStatus(419);
+            $this->withHeader('X-CSRF-TOKEN', 'delete-token')
+                ->deleteJson('/api/v1/me')->assertNoContent();
             $this->assertFileExists($ledger);
             $this->assertSame($id, json_decode(file_get_contents($ledger), true)['user_id']);
             $this->assertDatabaseMissing('users', ['id' => $id]);
